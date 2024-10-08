@@ -36,6 +36,10 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
     
     static var verboseLogging = false
     
+      var reconnectionAttempts = 0
+        let maxReconnectionAttempts = 5
+        let reconnectionDelay: TimeInterval = 2.0
+    
     private override init() {
         peripherals = [:]
         connectCallbacks = [:]
@@ -59,14 +63,17 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         
         BleManager.shared = self
         
-        
+//         manager
+//         = CBCentralManager(delegate: self, queue: nil, options: [
+//           CBCentralManagerOptionRestoreIdentifierKey: "BLECentralManagerIdentifier"
+//         ])
         NotificationCenter.default.addObserver(self, selector: #selector(bridgeReloading), name: NSNotification.Name(rawValue: "RCTBridgeWillReloadNotification"), object: nil)
     }
     
     @objc override static func requiresMainQueueSetup() -> Bool { return true }
     
     @objc override func supportedEvents() -> [String]! {
-        return ["BleManagerDidUpdateValueForCharacteristic", "BleManagerStopScan", "BleManagerDiscoverPeripheral", "BleManagerConnectPeripheral", "BleManagerDisconnectPeripheral", "BleManagerDidUpdateState", "BleManagerCentralManagerWillRestoreState", "BleManagerDidUpdateNotificationStateFor"]
+        return ["BleManagerDidUpdateValueForCharacteristic", "BleManagerStopScan", "BleManagerDiscoverPeripheral", "BleManagerConnectPeripheral", "BleManagerDisconnectPeripheral", "BleManagerDidUpdateState", "BleManagerCentralManagerWillRestoreState", "BleManagerDidUpdateNotificationStateFor","BLEConnectionEvent","BLECharacteristicUpdate"]
     }
     
     @objc override func startObserving() {
@@ -532,7 +539,7 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         }
     }
     
-    @objc func isScanning(_ callback: @escaping RCTResponseSenderBlock) {        
+    @objc func isScanning(_ callback: @escaping RCTResponseSenderBlock) {
         if let manager = manager {
             callback([NSNull(), manager.isScanning])
         } else {
@@ -740,27 +747,64 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         }
     }
     
-    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
-        if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], restoredPeripherals.count > 0 {
-            serialQueue.sync {
-                var data = [[String: Any]]()
-                for peripheral in restoredPeripherals {
-                    let p = Peripheral(peripheral:peripheral)
-                    peripherals[peripheral.uuidAsString()] = p
-                    data.append(p.advertisingInfo())
-                    peripheral.delegate = self
-                }
+//   func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+//       if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], restoredPeripherals.count > 0 {
+//           serialQueue.sync {
+//               var data = [[String: Any]]()
+//               for peripheral in restoredPeripherals {
+//                   let p = Peripheral(peripheral:peripheral)
+//                   peripherals[peripheral.uuidAsString()] = p
+//                   data.append(p.advertisingInfo())
+//                   peripheral.delegate = self
+//               }
+//
+//               NotificationCenter.default.post(name: Notification.Name("BleManagerCentralManagerWillRestoreState"), object: nil, userInfo: ["peripherals": data])
+//           }
+//       }
+//   }
+     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+         print("Restoring state...")
+        
+         if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], restoredPeripherals.count > 0 {
+            
+             serialQueue.sync {
+                 var data = [[String: Any]]()
                 
-                NotificationCenter.default.post(name: Notification.Name("BleManagerCentralManagerWillRestoreState"), object: nil, userInfo: ["peripherals": data])
-            }
-        }
-    }
+                 for peripheral in restoredPeripherals {
+                     // Create custom Peripheral object (if needed)
+                     let p = Peripheral(peripheral: peripheral)
+                     peripherals[peripheral.uuidAsString()] = p
+                     data.append(p.advertisingInfo())
+                    
+                     // Set the peripheral delegate
+                     peripheral.delegate = self
+                    
+                     // Check if the peripheral is connected, if not attempt to reconnect
+                     if peripheral.state == .connected {
+                         print("Peripheral \(peripheral.name ?? "Unknown") is already connected.")
+                     } else {
+                         print("Attempting to reconnect to peripheral \(peripheral.name ?? "Unknown") during state restoration.")
+                         central.connect(peripheral, options: nil)
+                     }
+                 }
+                
+                 // Notify observers about restored peripherals
+                 NotificationCenter.default.post(name: Notification.Name("BleManagerCentralManagerWillRestoreState"), object: nil, userInfo: ["peripherals": data])
+             }
+            
+         } else {
+             print("No peripherals to restore.")
+         }
+     }
+
     
     
     func centralManager(_ central: CBCentralManager,
                         didConnect peripheral: CBPeripheral) {
         NSLog("Peripheral Connected: \(peripheral.uuidAsString() )")
         peripheral.delegate = self
+          reconnectionAttempts = 0
+           self.sendEvent(withName: "BLEConnectionEvent", body: ["Status":"Connected"])
         
         /*
          The state of the peripheral isn't necessarily updated until a small
@@ -775,6 +819,7 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
                 if self.hasListeners {
                     self.connectedPeripherals.insert(peripheral.uuidAsString())
                     self.sendEvent(withName: "BleManagerConnectPeripheral", body: ["peripheral": peripheral.uuidAsString()])
+                    // self.sendEvent(withName: "BLEConnectionEvent", body: ["Status":"Connected"])
                 }
             }
         }
@@ -787,7 +832,40 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         NSLog(errorStr)
         
         invokeAndClearDictionary(&connectCallbacks, withKey: peripheral.uuidAsString(), usingParameters: [errorStr])
+         self.sendEvent(withName: "BLEConnectionEvent", body: ["status": "FailedToConnect"])
+         attemptReconnect()
     }
+    
+     func attemptReconnect() {
+         if reconnectionAttempts < maxReconnectionAttempts {
+             reconnectionAttempts += 1
+             print("Attempting to reconnect (\(reconnectionAttempts)/\(maxReconnectionAttempts))...")
+            
+             DispatchQueue.main.asyncAfter(deadline: .now() + reconnectionDelay) {
+                 if let peripheral = self.connectedPeripherals.first as? CBPeripheral {
+                     // Attempt to reconnect to the CBPeripheral
+                     self.manager?.connect(peripheral, options: nil)
+                 } else {
+                     // Start scanning if no connected peripheral is found
+                   //  self.startScanning()
+                    
+                    
+                 }
+             }
+         } else {
+             print("Max reconnection attempts reached. Stopping reconnection attempts.")
+             reconnectionAttempts = 0
+             // Optionally, start scanning again
+             //  startScanning()
+         }
+     }
+//     func startScanning() {
+//         let services: [CBUUID]? = nil // Add specific service UUIDs if necessary
+//         let options: [String: Any]? = nil // Additional scanning options
+//         manager?.scanForPeripherals(withServices: services, options: options)
+//         print("Started scanning for peripherals.")
+//     }
+
     
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral:
@@ -798,7 +876,11 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         if let error = error {
             NSLog("Error: \(error)")
         }
+//          self.sendEvent(withName: "BLEConnectionEvent", body: ["status": "Disconnected"])
+        attemptReconnect()
         
+        
+
         let errorStr = "Peripheral did disconnect: \(peripheralUUIDString)"
         
         invokeAndClearDictionary(&connectCallbacks, withKey: peripheralUUIDString, usingParameters: [errorStr])
@@ -1025,7 +1107,7 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         
         if let error = error {
             NSLog("Error reading descriptor value for \(descriptor.uuid) on characteristic \(descriptor.characteristic!.uuid) :\(error)")
-            invokeAndClearDictionary(&readDescriptorCallbacks, withKey: key, usingParameters: [error.localizedDescription, NSNull()])
+            invokeAndClearDictionary(&readDescriptorCallbacks, withKey: key, usingParameters: [error, NSNull()])
             return
         }
         
@@ -1073,7 +1155,7 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         
         if let error = error {
             NSLog("Error \(characteristic.uuid) :\(error)")
-            invokeAndClearDictionary(&readCallbacks, withKey: key, usingParameters: [error.localizedDescription, NSNull()])
+            invokeAndClearDictionary(&readCallbacks, withKey: key, usingParameters: [error, NSNull()])
             return
         }
         
