@@ -36,6 +36,10 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
     
     static var verboseLogging = false
     
+    // Add new properties for service discovery tracking
+    private var discoveredServices: [String: Set<CBService>] = [:]
+    private var serviceDiscoveryComplete: [String: Bool] = [:]
+    
     private override init() {
         peripherals = [:]
         connectCallbacks = [:]
@@ -740,18 +744,40 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         }
     }
     
+    // Enhanced state restoration
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
-        if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], restoredPeripherals.count > 0 {
+        if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] {
             serialQueue.sync {
                 var data = [[String: Any]]()
                 for peripheral in restoredPeripherals {
-                    let p = Peripheral(peripheral:peripheral)
+                    NSLog("Restoring peripheral: \(peripheral.name ?? "Unknown") - State: \(peripheral.state.rawValue)")
+                    
+                    let p = Peripheral(peripheral: peripheral)
                     peripherals[peripheral.uuidAsString()] = p
                     data.append(p.advertisingInfo())
                     peripheral.delegate = self
+                    
+                    // Handle restored peripheral based on its state
+                    switch peripheral.state {
+                    case .connected:
+                        connectedPeripherals.insert(peripheral.uuidAsString())
+                        // Rediscover services if needed
+                        if peripheral.services?.isEmpty ?? true {
+                            peripheral.discoverServices(nil)
+                        }
+                    case .connecting:
+                        // Let the connection complete
+                        NSLog("Peripheral is in connecting state during restoration")
+                    case .disconnected, .disconnecting:
+                        NSLog("Peripheral was disconnected during restoration")
+                    @unknown default:
+                        NSLog("Unknown peripheral state during restoration")
+                    }
                 }
                 
-                NotificationCenter.default.post(name: Notification.Name("BleManagerCentralManagerWillRestoreState"), object: nil, userInfo: ["peripherals": data])
+                if hasListeners {
+                    sendEvent(withName: "BleManagerCentralManagerWillRestoreState", body: ["peripherals": data])
+                }
             }
         }
     }
@@ -789,11 +815,76 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
         invokeAndClearDictionary(&connectCallbacks, withKey: peripheral.uuidAsString(), usingParameters: [errorStr])
     }
     
-    func centralManager(_ central: CBCentralManager,
-                        didDisconnectPeripheral peripheral:
-                        CBPeripheral, error: Error?) {
-        let peripheralUUIDString:String = peripheral.uuidAsString()
-        NSLog("Peripheral Disconnected: \(peripheralUUIDString)")
+    // Enhanced service discovery
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        let peripheralUUIDString = peripheral.uuidAsString()
+        
+        if let error = error {
+            NSLog("Error discovering services for \(peripheralUUIDString): \(error)")
+            invokeAndClearDictionary(&retrieveServicesCallbacks, withKey: peripheralUUIDString, usingParameters: [error.localizedDescription])
+            return
+        }
+        
+        if BleManager.verboseLogging {
+            NSLog("Services discovered for \(peripheralUUIDString)")
+        }
+        
+        var servicesForPeripheral = Set<CBService>()
+        servicesForPeripheral.formUnion(peripheral.services ?? [])
+        discoveredServices[peripheralUUIDString] = servicesForPeripheral
+        
+        if let services = peripheral.services {
+            for service in services {
+                if BleManager.verboseLogging {
+                    NSLog("Discovering characteristics for service: \(service.uuid)")
+                }
+                peripheral.discoverCharacteristics(nil, for: service)
+            }
+        } else {
+            // No services found
+            serviceDiscoveryComplete[peripheralUUIDString] = true
+            if let p = peripherals[peripheralUUIDString] {
+                invokeAndClearDictionary(&retrieveServicesCallbacks, withKey: peripheralUUIDString, usingParameters: [NSNull(), p.servicesInfo()])
+            }
+        }
+    }
+    
+    // Enhanced characteristic discovery
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        let peripheralUUIDString = peripheral.uuidAsString()
+        
+        if let error = error {
+            NSLog("Error discovering characteristics for service \(service.uuid): \(error)")
+            return
+        }
+        
+        if BleManager.verboseLogging {
+            NSLog("Characteristics discovered for service: \(service.uuid)")
+        }
+        
+        // Update discovered services tracking
+        discoveredServices[peripheralUUIDString]?.remove(service)
+        
+        // Check if all services have been discovered
+        if discoveredServices[peripheralUUIDString]?.isEmpty == true {
+            serviceDiscoveryComplete[peripheralUUIDString] = true
+            if let p = peripherals[peripheralUUIDString] {
+                invokeAndClearDictionary(&retrieveServicesCallbacks, withKey: peripheralUUIDString, usingParameters: [NSNull(), p.servicesInfo()])
+            }
+            // Cleanup
+            discoveredServices.removeValue(forKey: peripheralUUIDString)
+        }
+    }
+    
+    // Add cleanup method for service discovery state
+    private func cleanupServiceDiscovery(for peripheralUUID: String) {
+        discoveredServices.removeValue(forKey: peripheralUUID)
+        serviceDiscoveryComplete.removeValue(forKey: peripheralUUID)
+    }
+    
+    // Update disconnect handling to include cleanup
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        let peripheralUUIDString = peripheral.uuidAsString()
         
         if let error = error {
             NSLog("Error: \(error)")
@@ -844,6 +935,9 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
                 sendEvent(withName: "BleManagerDisconnectPeripheral", body: ["peripheral": peripheralUUIDString])
             }
         }
+        
+        // Add cleanup
+        cleanupServiceDiscovery(for: peripheralUUIDString)
     }
     
     
@@ -911,31 +1005,6 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
     }
     
     func peripheral(_ peripheral: CBPeripheral,
-                    didDiscoverServices error: Error?) {
-        if let error = error {
-            NSLog("Error: \(error)")
-            return
-        }
-        if BleManager.verboseLogging {
-            NSLog("Services Discover")
-        }
-        
-        var servicesForPeripheral = Set<CBService>()
-        servicesForPeripheral.formUnion(peripheral.services ?? [])
-        retrieveServicesLatches[peripheral.uuidAsString()] = servicesForPeripheral
-        
-        if let services = peripheral.services {
-            for service in services {
-                if BleManager.verboseLogging {
-                    NSLog("Service \(service.uuid.uuidString) \(service.description)")
-                }
-                peripheral.discoverIncludedServices(nil, for: service) // discover included services
-                peripheral.discoverCharacteristics(nil, for: service) // discover characteristics for service
-            }
-        }
-    }
-    
-    func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverIncludedServicesFor service: CBService,
                     error: Error?) {
         if let error = error {
@@ -943,28 +1012,6 @@ class BleManager: RCTEventEmitter, CBCentralManagerDelegate, CBPeripheralDelegat
             return
         }
         peripheral.discoverCharacteristics(nil, for: service) // discover characteristics for included service
-    }
-    
-    func peripheral(_ peripheral: CBPeripheral,
-                    didDiscoverCharacteristicsFor service: CBService,
-                    error: Error?) {
-        if let error = error {
-            NSLog("Error: \(error)")
-            return
-        }
-        if BleManager.verboseLogging {
-            NSLog("Characteristics For Service Discover")
-        }
-        
-        var characteristicsForService = Set<CBCharacteristic>()
-        characteristicsForService.formUnion(service.characteristics ?? [])
-        characteristicsLatches[service.uuid.uuidString] = characteristicsForService
-        
-        if let characteristics = service.characteristics {
-            for characteristic in characteristics {
-                peripheral.discoverDescriptors(for: characteristic)
-            }
-        }
     }
     
     func peripheral(_ peripheral: CBPeripheral,
